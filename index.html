@@ -195,8 +195,22 @@
             <div class="form-group"><label data-key="username_label">Username (Mobile Number)</label><input type="text" id="loginUsername" placeholder="61234567"></div>
             <div class="form-group"><label data-key="password_label">Password (First 4 numeric digits of HKID)</label><input type="password" id="loginPassword" placeholder="1234"></div>
             <button id="doLoginBtn" style="width:100%;"><span data-key="login_btn">Login</span></button>
-            <div class="login-instruction" data-key="login_instruction_en"><strong>📋 Login Instructions:</strong><br>• <strong>Admin:</strong> Username: "admin" | Password: "admin123"<br>• <strong>Patient:</strong> Use your registered mobile number as Username<br>• <strong>Password:</strong> First 4 numeric digits of your HKID<br>• Contact clinic admin at <strong>+852 55057221</strong> for login issues.</div>
-            <div class="login-instruction" data-key="login_instruction_zh" style="display:none;"><strong>📋 登入說明：</strong><br>• <strong>管理員：</strong> 用戶名稱："admin" | 密碼："admin123"<br>• <strong>病人：</strong> 使用已登記的手機號碼作為用戶名稱<br>• <strong>密碼：</strong> 香港身份證號碼的首4位數字<br>• 如登入遇到問題，請致電 <strong>+852 55057221</strong> 聯繫診所管理員。</div>
+            <div class="login-instruction" data-key="login_instruction_en">
+                <strong>📋 Login Instructions:</strong><br>
+                • <strong>Admin:</strong> Username: "admin" | Password: "admin123"<br>
+                • <strong>Patient:</strong> Use your registered mobile number as Username<br>
+                • <strong>Password:</strong> First 4 characters of your HKID or Passport (including letters)<br>
+                • <strong>Examples:</strong> HKID A123456(7) ➡️ password: A123 | Passport PP123456789 ➡️ password: PP12<br>
+                • Contact clinic admin at <strong>+852 55057221</strong> for login issues.
+            </div>
+            <div class="login-instruction" data-key="login_instruction_zh" style="display:none;">
+                <strong>📋 登入說明：</strong><br>
+                • <strong>管理員：</strong> 用戶名稱："admin" | 密碼："admin123"<br>
+                • <strong>病人：</strong> 使用已登記的手機號碼作為用戶名稱<br>
+                • <strong>密碼：</strong> 香港身份證或護照號碼的首4位（包括字母）<br>
+                • <strong>範例：</strong> 身份證 A123456(7) ➡️ 密碼: A123 | 護照 PP123456789 ➡️ 密碼: PP12<br>
+                • 如登入遇到問題，請致電 <strong>+852 55057221</strong> 聯繫診所管理員。
+            </div>
         </div>
     </div>
 
@@ -278,7 +292,11 @@
     
     // ========== DATA MODEL ==========
     let patients = []; let nextPatientId = 100; let currentUser = null; let pendingNotification = false;
-    function extractNumericHkid(input) { return input.replace(/\D/g, '').substring(0,4); }
+    function extractHkid(input) { 
+        // Remove spaces and take first 4 characters (including letters)
+        return input.replace(/\s/g, '').substring(0,4).toUpperCase(); 
+    }
+    
     function saveData() { localStorage.setItem("swindon_patients_v10", JSON.stringify(patients)); }
     function loadData() { 
         const stored = localStorage.getItem("swindon_patients_v10"); 
@@ -365,31 +383,52 @@
         }
         try {
             for (const patient of patients) {
+                // Ensure hkidNum is properly saved
+                const hkidValue = patient.hkidNum || '';
+                
                 // Upsert patient
                 const { error: patientError } = await supabaseClient
                     .from('patients')
                     .upsert({
                         id: patient.id,
-                        hkid_num: patient.hkidNum,
+                        hkid_num: hkidValue,
                         mobiles: patient.mobiles,
                         emails: patient.emails || [],
-                        password: patient.password,
+                        password: hkidValue,
                         updated_at: new Date().toISOString()
                     });
                 if (patientError) throw patientError;
                 
-                // Save reports
+                // Save reports with dataURL handling
                 for (const report of patient.reports) {
-                    const { error: reportError } = await supabaseClient
+                    // Check if report already exists in cloud
+                    const { data: existingReport } = await supabaseClient
                         .from('reports')
-                        .upsert({
-                            patient_id: patient.id,
-                            filename: report.filename,
-                            data_url: report.dataURL,
-                            upload_time: report.uploadTime || new Date().toISOString(),
-                            staff: report.staff || ''
-                        });
-                    if (reportError) throw reportError;
+                        .select('id')
+                        .eq('patient_id', patient.id)
+                        .eq('filename', report.filename)
+                        .maybeSingle();
+                    
+                    const reportData = {
+                        patient_id: patient.id,
+                        filename: report.filename,
+                        data_url: report.dataURL,
+                        upload_time: report.uploadTime || new Date().toISOString(),
+                        staff: report.staff || ''
+                    };
+                    
+                    if (existingReport) {
+                        const { error: reportError } = await supabaseClient
+                            .from('reports')
+                            .update(reportData)
+                            .eq('id', existingReport.id);
+                        if (reportError) throw reportError;
+                    } else {
+                        const { error: reportError } = await supabaseClient
+                            .from('reports')
+                            .insert(reportData);
+                        if (reportError) throw reportError;
+                    }
                 }
                 
                 // Save appointment
@@ -496,13 +535,147 @@
         if(pendingNotification) { showToast("📢 New appointment update detected!"); pendingNotification=false; }
     }
     
-    function sendWhatsAppSecure(patient) { const link = window.location.href; const msg = encodeURIComponent(`Hello, Swindon Medical. Your report is ready. Login: ${link}`); patient.mobiles.forEach(phone => window.open(`https://wa.me/${phone}?text=${msg}`, '_blank')); }
-    function sendEmailSecure(patient) { if(!patient.emails.length) return; const link = window.location.href; const body = encodeURIComponent(`Your report is ready: ${link}`); patient.emails.forEach(email => window.open(`mailto:${email}?subject=Health Report&body=${body}`, '_blank')); }
+    function getPortalMessage(patient) {
+        const hkid = patient.hkidNum || '';
+        const fullHkid = hkid + '????'; // Show first 4 only for security
+        
+        return `🏥【德信醫療】您的身體檢查報告現已備妥
+    
+    您好：
+    多謝選用德信醫療。閣下的身體檢查報告已經簽發，請點擊以下連結並登入系統下載電子報告：
+    
+    🔗 報告下載連結： https://sholowai88.github.io/swindon-medical-portal/
+    
+    【登入帳戶資料】
+    👤 登入名稱： ${patient.mobiles[0] || '您的手機號碼'}
+    🔑 初始密碼： ${hkid}
+    
+    🔖【密碼輸入範例】
+    。如香港身份證號碼為：A123456(7) ➡️ 請輸入 A123
+    。如護照號碼為：PP123456789 ➡️ 請輸入PP12
+    
+    成功登入後，下載體檢報告，【報告密碼】是：
+    。如香港身份證號碼為：A123456(7) ➡️ 請輸入 A1234567
+    。如護照號碼為：PP123456789 ➡️ 請輸入PP123456789
+    ——————
+    我們會聯繫您講解報告，請留意電話【2951-1xxx】。
+    ——————
+    📞 【查詢及支援】
+    電話：(852) 2951 1988
+    WhatsApp：(852) 5606 9390
+    
+    祝 生活愉快，身體健康。
+    
+    德信醫療 敬上`;
+    }
+    
+    function sendWhatsAppSecure(patient) { 
+        const fullMsg = getPortalMessage(patient);
+        const encodedMsg = encodeURIComponent(fullMsg); 
+        patient.mobiles.forEach(phone => { 
+            // Remove any non-digit characters from phone
+            const cleanPhone = phone.replace(/\D/g, '');
+            window.open(`https://wa.me/${cleanPhone}?text=${encodedMsg}`, '_blank'); 
+        }); 
+        alert(`WhatsApp messages sent to: ${patient.mobiles.join(', ')}`); 
+    }
+    
+    function sendEmailSecure(patient) { 
+        if(!patient.emails.length){alert("No email addresses");return;} 
+        const fullMsg = getPortalMessage(patient);
+        const subject = encodeURIComponent("🏥 德信醫療 - 您的身體檢查報告已備妥"); 
+        const body = encodeURIComponent(fullMsg); 
+        patient.emails.forEach(email => { 
+            window.open(`mailto:${email}?subject=${subject}&body=${body}`, '_blank'); 
+        }); 
+        alert(`Email messages sent to: ${patient.emails.join(', ')}`); 
+    }
+    
     function openEditModal(patient) { const modal=document.createElement("div"); modal.className="modal"; modal.innerHTML=`<div class="modal-content"><h3>Edit Patient</h3><input id="editMob" value="${patient.mobiles.join(',')}" placeholder="Mobiles"><input id="editHkid" value="${patient.hkidNum}" placeholder="HKID"><input id="editEmail" value="${patient.emails.join(',')}" placeholder="Emails"><button id="saveEdit">Save</button><button onclick="this.closest('.modal').remove()">Cancel</button></div>`; document.body.appendChild(modal); document.getElementById("saveEdit").onclick=()=>{ patient.mobiles = document.getElementById("editMob").value.split(',').map(s=>s.trim()); patient.hkidNum = extractNumericHkid(document.getElementById("editHkid").value); patient.emails = document.getElementById("editEmail").value.split(',').map(s=>s.trim()); patient.password = patient.hkidNum; saveData(); saveDataToCloud(); renderAdminTable(); modal.remove(); }; }
-    function createOrUpdatePatient() { const mobiles = document.getElementById("patientMobiles").value.split(',').map(s=>s.trim()).filter(s=>s); const hkidNum = extractNumericHkid(document.getElementById("patientHkidNum").value); const emails = document.getElementById("patientEmails").value.split(',').map(s=>s.trim()).filter(s=>s); const accession = document.getElementById("accessionNumber").value; const staff = document.getElementById("reportingStaff").value; const files = document.getElementById("reportPdfFile").files; if(!mobiles.length || !hkidNum || hkidNum.length!==4){ alert("Need mobile and 4-digit HKID"); return; }
-        let patient = patients.find(p => p.hkidNum === hkidNum); if(patient) { patient.mobiles = [...new Set([...patient.mobiles, ...mobiles])]; patient.emails = [...new Set([...patient.emails, ...emails])]; patient.password = hkidNum; } else { patient = { id:genPatientId(), hkidNum, mobiles, emails, password:hkidNum, reports:[], appointment:{ datetime:"", status:"pending", updateCount:0 } }; patients.push(patient); }
-        if(files.length){ Array.from(files).forEach(file=>{ if(file.type==="application/pdf"){ const reader=new FileReader(); reader.onload=function(e){ const finalName = accession ? `${accession}.pdf` : file.name; const now = new Date().toLocaleString('zh-HK'); patient.reports.push({ filename: finalName, dataURL: e.target.result, uploadTime: now, staff }); saveData(); saveDataToCloud(); renderAdminTable(); showToast(`Uploaded: ${finalName}`); }; reader.readAsDataURL(file); } }); } else { saveData(); saveDataToCloud(); renderAdminTable(); }
-        document.getElementById("patientMobiles").value=""; document.getElementById("patientHkidNum").value=""; document.getElementById("patientEmails").value=""; document.getElementById("accessionNumber").value=""; document.getElementById("reportPdfFile").value=""; renderAdminTable(); alert("Patient saved!"); }
+    function createOrUpdatePatient() { 
+        const mobiles = document.getElementById("patientMobiles").value.split(',').map(s=>s.trim()).filter(s=>s); 
+        const hkidRaw = document.getElementById("patientHkidNum").value.trim();
+        const hkidNum = extractHkid(hkidRaw); // Updated to include letters
+        const emails = document.getElementById("patientEmails").value.split(',').map(s=>s.trim()).filter(s=>s); 
+        const accession = document.getElementById("accessionNumber").value; 
+        const staff = document.getElementById("reportingStaff").value; 
+        const files = document.getElementById("reportPdfFile").files; 
+        
+        if(!mobiles.length || !hkidNum || hkidNum.length!==4){ 
+            alert("Need mobile and 4-character HKID/Passport prefix"); 
+            return; 
+        }
+        
+        let patient = patients.find(p => p.hkidNum === hkidNum); 
+        if(patient) { 
+            patient.mobiles = [...new Set([...patient.mobiles, ...mobiles])]; 
+            patient.emails = [...new Set([...patient.emails, ...emails])]; 
+            patient.password = hkidNum; 
+        } else { 
+            patient = { 
+                id: genPatientId(), 
+                hkidNum, 
+                mobiles, 
+                emails, 
+                password: hkidNum, 
+                reports: [], 
+                appointment: { datetime: "", status: "pending", updateCount: 0 } 
+            }; 
+            patients.push(patient); 
+        }
+        
+        // Handle file uploads with proper cloud sync
+        if(files.length){ 
+            let uploadPromises = [];
+            Array.from(files).forEach(file=>{ 
+                if(file.type==="application/pdf"){ 
+                    const promise = new Promise((resolve) => {
+                        const reader=new FileReader(); 
+                        reader.onload=function(e){ 
+                            const finalName = accession ? `${accession}.pdf` : file.name; 
+                            const now = new Date().toLocaleString('zh-HK'); 
+                            const reportData = { 
+                                filename: finalName, 
+                                dataURL: e.target.result, 
+                                uploadTime: now, 
+                                staff: staff 
+                            };
+                            patient.reports.push(reportData); 
+                            saveData(); 
+                            // Sync to cloud immediately
+                            saveDataToCloud().then(() => {
+                                renderAdminTable(); 
+                                showToast(`Uploaded: ${finalName}`);
+                                resolve();
+                            });
+                        }; 
+                        reader.readAsDataURL(file);
+                    });
+                    uploadPromises.push(promise);
+                } else { 
+                    alert("Only PDF files are allowed"); 
+                } 
+            });
+            
+            // Wait for all uploads to complete
+            Promise.all(uploadPromises).then(() => {
+                renderAdminTable();
+                showToast("All files uploaded and synced to cloud!");
+            });
+        } else { 
+            saveData(); 
+            saveDataToCloud().then(() => {
+                renderAdminTable(); 
+            });
+        }
+        
+        // Clear form fields
+        document.getElementById("patientMobiles").value=""; 
+        document.getElementById("patientHkidNum").value=""; 
+        document.getElementById("patientEmails").value=""; 
+        document.getElementById("accessionNumber").value=""; 
+        document.getElementById("reportPdfFile").value=""; 
+    }
     function exportToExcel() { const data=patients.map(p=>({ MobileNumbers: p.mobiles.join(';'), HKID: p.hkidNum, Emails: p.emails.join(';'), Reports: p.reports.map(r=>r.filename).join("; "), Appointment: p.appointment?.datetime, Status: p.appointment?.status })); const ws=XLSX.utils.json_to_sheet(data); const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,"Patients"); XLSX.writeFile(wb,`Patients_${Date.now()}.xlsx`); }
     function showToast(msg){ const t=document.createElement("div"); t.className="toast"; t.innerText=msg; document.body.appendChild(t); setTimeout(()=>t.remove(),2500); }
     function loadPatientReports(){ const pat=patients.find(p=>p.id===currentUser.patientId); const container=document.getElementById("pdfReportsList"); if(!pat||!pat.reports.length){ container.innerHTML="<p>No reports</p>"; return; } container.innerHTML=""; pat.reports.forEach(rep=>{ const div=document.createElement("div"); div.className="file-list-item"; div.innerHTML=`<span>📄 ${rep.filename}<br><small>Staff: ${rep.staff||'N/A'} | ${rep.uploadTime||''}</small></span><div><button class="previewP" data-url="${rep.dataURL}" data-name="${rep.filename}">Preview</button><button class="downloadP" data-url="${rep.dataURL}" data-name="${rep.filename}">Download</button></div>`; container.appendChild(div); }); document.querySelectorAll(".previewP").forEach(btn=>btn.addEventListener("click",()=>showPdfModal(btn.dataset.url, btn.dataset.name))); document.querySelectorAll(".downloadP").forEach(btn=>btn.addEventListener("click",()=>{ const a=document.createElement("a"); a.href=btn.dataset.url; a.download=btn.dataset.name; a.click(); })); }
@@ -525,7 +698,28 @@
         };
     }
     
-    function confirmLogout() { const overlay = document.createElement("div"); overlay.className = "confirm-dialog-overlay"; overlay.innerHTML = `<div class="confirm-dialog"><h3>Confirm Logout</h3><p>Are you sure you want to logout?</p><div class="dialog-buttons"><button id="confirmLogoutYes">Yes, Logout</button><button id="confirmLogoutNo">Cancel</button></div></div>`; document.body.appendChild(overlay); overlay.querySelector("#confirmLogoutYes").onclick = () => { currentUser=null; document.getElementById("loginView").style.display="block"; document.getElementById("dashboardView").style.display="none"; document.getElementById("chatbotIcon").style.display="none"; document.getElementById("chatWindow").style.display="none"; overlay.remove(); }; overlay.querySelector("#confirmLogoutNo").onclick = () => overlay.remove(); }
+    function confirmLogout() { 
+        const overlay = document.createElement("div"); 
+        overlay.className = "confirm-dialog-overlay"; 
+        overlay.innerHTML = `<div class="confirm-dialog"><h3>Confirm Logout</h3><p>Are you sure you want to logout?</p><div class="dialog-buttons"><button id="confirmLogoutYes">Yes, Logout</button><button id="confirmLogoutNo">Cancel</button></div></div>`; 
+        document.body.appendChild(overlay); 
+        
+        overlay.querySelector("#confirmLogoutYes").onclick = () => { 
+            currentUser = null; 
+            document.getElementById("loginView").style.display = "block"; 
+            document.getElementById("dashboardView").style.display = "none"; 
+            document.getElementById("chatbotIcon").style.display = "none"; 
+            document.getElementById("chatWindow").style.display = "none"; 
+            
+            // Clear login fields for security
+            document.getElementById("loginUsername").value = "";
+            document.getElementById("loginPassword").value = "";
+            
+            overlay.remove(); 
+            showToast("Logged out successfully. Login fields cleared for security.");
+        }; 
+        overlay.querySelector("#confirmLogoutNo").onclick = () => overlay.remove(); 
+    }
     
     // ========== AI CHATBOT ==========
     let emojiIndex = 0; const emojis = ["👩‍⚕️😊", "👩‍⚕️🥰", "👩‍⚕️🤗", "👩‍⚕️😎", "👩‍⚕️💖", "👩‍⚕️⭐"];
@@ -533,7 +727,32 @@
     function initChatbot() { const input = document.getElementById("chatInput"); const sendBtn = document.getElementById("sendChatBtn"); const messages = document.getElementById("chatMessages"); const addMessage = (text, isUser) => { const div = document.createElement("div"); div.className = `chat-message ${isUser ? 'user-message' : 'bot-message'}`; div.innerText = text; messages.appendChild(div); messages.scrollTop = messages.scrollHeight; }; const getBotResponse = (q) => { const lower = q.toLowerCase(); if(lower.includes("login") || lower.includes("登入")) return "Admin login: admin/admin123. Patient login: use your registered mobile as username and first 4 numeric HKID digits as password."; if(lower.includes("appointment") || lower.includes("预约")) return "Go to Appointment tab, select date/time, then click 'Confirm and Notify Admin'. The admin will be notified via WhatsApp."; if(lower.includes("report") || lower.includes("报告")) return "Click the Report button to view and download your health reports. Preview supports multi-page PDF with zoom."; if(lower.includes("sync") || lower.includes("同步")) return "Click 'Sync to Cloud' to upload your data. The system auto-syncs when you save changes."; return "I'm here to help! Ask me about login, appointments, reports, or using the portal."; }; sendBtn.onclick = () => { const text = input.value.trim(); if(!text) return; addMessage(text, true); setTimeout(() => addMessage(getBotResponse(text), false), 500); input.value = ""; }; input.addEventListener("keypress", (e) => { if(e.key === "Enter") sendBtn.click(); }); }
     
     // ========== LOGIN & DASHBOARD ==========
-    document.getElementById("doLoginBtn").addEventListener("click",()=>{ const uname=document.getElementById("loginUsername").value.trim(); const pwd=document.getElementById("loginPassword").value.trim(); if(uname==="admin"&&pwd==="admin123"){ currentUser={username:"Admin",role:"admin"}; showDashboard(); return; } const found=patients.find(p=>p.mobiles.includes(uname) && p.password===pwd); if(found){ currentUser={username:uname,role:"patient",patientId:found.id}; showDashboard(); } else alert("Invalid credentials. Contact +852 55057221 for help."); });
+    document.getElementById("doLoginBtn").addEventListener("click", () => { 
+        const uname = document.getElementById("loginUsername").value.trim(); 
+        const pwd = document.getElementById("loginPassword").value.trim().toUpperCase(); 
+        
+        if(uname === "admin" && pwd === "admin123") { 
+            currentUser = { username: "Admin", role: "admin" }; 
+            showDashboard(); 
+            return; 
+        } 
+        
+        // Patient login - check against stored HKID (now includes letters)
+        const found = patients.find(p => {
+            // Check if username matches any mobile
+            const mobileMatch = p.mobiles.some(m => m === uname);
+            // Check if password matches stored HKID
+            const passwordMatch = p.password === pwd || p.hkidNum === pwd;
+            return mobileMatch && passwordMatch;
+        }); 
+        
+        if(found) { 
+            currentUser = { username: uname, role: "patient", patientId: found.id }; 
+            showDashboard(); 
+        } else { 
+            alert("Invalid credentials. Please check your mobile number and HKID/Passport prefix. Contact +852 55057221 for help."); 
+        } 
+    });
     
     function showDashboard(){ 
         document.getElementById("loginView").style.display="none"; 
