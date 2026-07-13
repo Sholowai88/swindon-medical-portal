@@ -269,6 +269,7 @@
     
     let supabaseClient = null;
     let isCloudConnected = false;
+    let storageBucket = 'reports'; // Name of your storage bucket
     
     try {
         supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -379,6 +380,71 @@
     }
     
     function saveData() { localStorage.setItem("swindon_patients_v10", JSON.stringify(patients)); }
+    
+    // ========== SUPABASE STORAGE FUNCTIONS ==========
+    
+    // Upload PDF to Supabase Storage
+    async function uploadFileToStorage(patientId, fileData, filename) {
+        if (!isCloudConnected || !supabaseClient) {
+            console.log("Cloud not configured, skipping storage upload");
+            return null;
+        }
+        
+        try {
+            // Convert dataURL to File object
+            const response = await fetch(fileData);
+            const blob = await response.blob();
+            
+            // Create file path: patient_id/timestamp_filename.pdf
+            const timestamp = Date.now();
+            const filePath = `${patientId}/${timestamp}_${filename}`;
+            
+            // Upload to Supabase Storage
+            const { data, error } = await supabaseClient.storage
+                .from(storageBucket)
+                .upload(filePath, blob, {
+                    cacheControl: '3600',
+                    upsert: true,
+                    contentType: 'application/pdf'
+                });
+            
+            if (error) throw error;
+            
+            // Get public URL
+            const { data: urlData } = supabaseClient.storage
+                .from(storageBucket)
+                .getPublicUrl(filePath);
+            
+            console.log("File uploaded to storage:", urlData.publicUrl);
+            return urlData.publicUrl;
+            
+        } catch (error) {
+            console.error("Storage upload error:", error);
+            showToast("Storage upload failed: " + error.message);
+            return null;
+        }
+    }
+    
+    // Delete file from Supabase Storage
+    async function deleteFileFromStorage(filePath) {
+        if (!isCloudConnected || !supabaseClient) {
+            return false;
+        }
+        
+        try {
+            const { error } = await supabaseClient.storage
+                .from(storageBucket)
+                .remove([filePath]);
+            
+            if (error) throw error;
+            console.log("File deleted from storage:", filePath);
+            return true;
+        } catch (error) {
+            console.error("Storage delete error:", error);
+            return false;
+        }
+    }
+    
     function loadData() { 
         const stored = localStorage.getItem("swindon_patients_v10"); 
         if(stored) { 
@@ -423,6 +489,7 @@
             const newPatients = patientsData.map(p => {
                 const patientReports = reportsData.filter(r => r.patient_id === p.id);
                 const patientAppointment = appointmentsData.find(a => a.patient_id === p.id);
+                
                 return {
                     id: p.id,
                     hkidNum: p.hkid_num || '',
@@ -431,9 +498,11 @@
                     password: p.hkid_num || '',
                     reports: patientReports.map(r => ({
                         filename: r.filename || 'unknown.pdf',
+                        // If data_url is a storage URL, we keep it as the source
                         dataURL: r.data_url || '',
                         uploadTime: r.upload_time || new Date().toISOString(),
-                        staff: r.staff || ''
+                        staff: r.staff || '',
+                        filePath: r.file_path || null // Store for deletion
                     })),
                     appointment: patientAppointment ? {
                         datetime: patientAppointment.datetime || '',
@@ -481,13 +550,28 @@
             
             if (fetchError) throw new Error(`Fetch patients error: ${fetchError.message}`);
             
-            // Find patients to delete (in cloud but not in local)
+            // Find patients to delete
             const cloudPatientIds = cloudPatients.map(p => p.id);
             const toDeleteIds = cloudPatientIds.filter(id => !localPatientIds.includes(id));
             
             // Delete patients that no longer exist locally
             for (const deleteId of toDeleteIds) {
-                // Delete reports
+                // Get reports for this patient first to delete files from storage
+                const { data: reportsToDelete } = await supabaseClient
+                    .from('reports')
+                    .select('file_path')
+                    .eq('patient_id', deleteId);
+                
+                // Delete files from storage
+                if (reportsToDelete) {
+                    for (const report of reportsToDelete) {
+                        if (report.file_path) {
+                            await deleteFileFromStorage(report.file_path);
+                        }
+                    }
+                }
+                
+                // Delete reports from database
                 const { error: reportDeleteError } = await supabaseClient
                     .from('reports')
                     .delete()
@@ -527,35 +611,50 @@
                 if (patientError) throw new Error(`Upsert patient error: ${patientError.message}`);
                 
                 // Handle reports - delete existing and re-insert
+                // First get existing reports to delete files
+                const { data: existingReports } = await supabaseClient
+                    .from('reports')
+                    .select('id, file_path')
+                    .eq('patient_id', patient.id);
+                
+                // Delete files from storage
+                if (existingReports) {
+                    for (const report of existingReports) {
+                        if (report.file_path) {
+                            await deleteFileFromStorage(report.file_path);
+                        }
+                    }
+                }
+                
+                // Delete reports from database
                 const { error: deleteReportsError } = await supabaseClient
                     .from('reports')
                     .delete()
                     .eq('patient_id', patient.id);
                 if (deleteReportsError) throw new Error(`Delete reports error: ${deleteReportsError.message}`);
                 
-                // Insert fresh reports
-                let reportInsertCount = 0;
+                // Insert fresh reports with storage URLs
                 for (const report of patient.reports) {
                     if (report.dataURL) {
+                        // Upload file to storage
+                        const filePath = await uploadFileToStorage(patient.id, report.dataURL, report.filename);
+                        
+                        // Insert report record with storage URL
                         const { error: reportError } = await supabaseClient
                             .from('reports')
                             .insert({
                                 patient_id: patient.id,
                                 filename: report.filename || 'unknown.pdf',
-                                data_url: report.dataURL,
+                                data_url: filePath || '', // Store the storage URL
                                 upload_time: report.uploadTime || new Date().toISOString(),
-                                staff: report.staff || ''
+                                staff: report.staff || '',
+                                file_path: filePath ? `${patient.id}/${report.filename}` : null
                             });
-                        if (reportError) {
-                            console.error("Report insert error:", reportError);
-                            throw new Error(`Insert report error: ${reportError.message}`);
-                        }
-                        reportInsertCount++;
+                        if (reportError) throw new Error(`Insert report error: ${reportError.message}`);
                     }
                 }
-                console.log(`Inserted ${reportInsertCount} reports for patient ${patient.id}`);
                 
-                // Handle appointments - delete existing and re-insert
+                // Handle appointments
                 const { error: deleteApptError } = await supabaseClient
                     .from('appointments')
                     .delete()
@@ -642,24 +741,57 @@
             .subscribe();
     }
 
-    // ========== MULTI-PAGE PDF VIEWER ==========
+    // Multi-page PDF viewer with zoom and page selection
     async function showPdfModal(dataURL, filename) {
-        const modalDiv = document.createElement("div"); modalDiv.className = "modal";
+        // If dataURL is a storage URL (starts with http), fetch it as blob
+        let pdfSource = dataURL;
+        
+        if (dataURL && dataURL.startsWith('http')) {
+            try {
+                const response = await fetch(dataURL);
+                const blob = await response.blob();
+                pdfSource = URL.createObjectURL(blob);
+            } catch (error) {
+                console.error("Error fetching PDF from storage:", error);
+                showToast("Error loading PDF from cloud storage");
+                return;
+            }
+        }
+        
+        const modalDiv = document.createElement("div"); 
+        modalDiv.className = "modal";
         modalDiv.innerHTML = `<div class="modal-content"><h3>${filename}</h3><div class="pdf-controls"><button id="zoomInBtn">🔍+ Zoom In</button><button id="zoomOutBtn">🔍- Zoom Out</button><button id="prevPageBtn">◀ Prev</button><span id="pageInfo" class="pdf-page-info">Page 1 / ?</span><button id="nextPageBtn">Next ▶</button></div><div id="pdfCanvasContainer" style="width:100%; max-height:60vh; overflow:auto; text-align:center;"><canvas id="pdfCanvas" style="width:100%;"></canvas></div><button id="closeModalBtn" style="margin-top:15px;">Close</button></div>`;
         document.body.appendChild(modalDiv);
-        const canvas = modalDiv.querySelector("#pdfCanvas"); const ctx = canvas.getContext('2d');
+        
+        const canvas = modalDiv.querySelector("#pdfCanvas"); 
+        const ctx = canvas.getContext('2d');
         let pdfDoc = null, currentPage = 1, scale = 1.5;
+        
         try {
-            const loadingTask = pdfjsLib.getDocument(dataURL);
+            const loadingTask = pdfjsLib.getDocument(pdfSource);
             pdfDoc = await loadingTask.promise;
-            const renderPage = async (pageNum) => { const page = await pdfDoc.getPage(pageNum); const viewport = page.getViewport({ scale }); canvas.width = viewport.width; canvas.height = viewport.height; await page.render({ canvasContext: ctx, viewport: viewport }).promise; modalDiv.querySelector("#pageInfo").innerText = `Page ${pageNum} / ${pdfDoc.numPages}`; };
+            const renderPage = async (pageNum) => { 
+                const page = await pdfDoc.getPage(pageNum); 
+                const viewport = page.getViewport({ scale }); 
+                canvas.width = viewport.width; 
+                canvas.height = viewport.height; 
+                await page.render({ canvasContext: ctx, viewport: viewport }).promise; 
+                modalDiv.querySelector("#pageInfo").innerText = `Page ${pageNum} / ${pdfDoc.numPages}`; 
+            };
             await renderPage(1);
             modalDiv.querySelector("#zoomInBtn").onclick = async () => { scale += 0.3; await renderPage(currentPage); };
             modalDiv.querySelector("#zoomOutBtn").onclick = async () => { if(scale > 0.5) { scale -= 0.3; await renderPage(currentPage); } };
             modalDiv.querySelector("#prevPageBtn").onclick = async () => { if(currentPage > 1) { currentPage--; await renderPage(currentPage); } };
             modalDiv.querySelector("#nextPageBtn").onclick = async () => { if(currentPage < pdfDoc.numPages) { currentPage++; await renderPage(currentPage); } };
-        } catch(e) { modalDiv.querySelector("#pdfCanvasContainer").innerHTML = `<p style="color:red;">Error loading PDF: ${e.message}</p>`; }
-        modalDiv.querySelector("#closeModalBtn").onclick = () => modalDiv.remove();
+        } catch(e) { 
+            modalDiv.querySelector("#pdfCanvasContainer").innerHTML = `<p style="color:red;">Error loading PDF: ${e.message}</p>`; 
+        }
+        modalDiv.querySelector("#closeModalBtn").onclick = () => { 
+            if (pdfSource && pdfSource.startsWith('blob:')) {
+                URL.revokeObjectURL(pdfSource);
+            }
+            modalDiv.remove(); 
+        };
     }
 
     // ========== RENDER FUNCTIONS ==========
@@ -677,7 +809,40 @@
             if(patient.reports.length) { let rh="", th=""; patient.reports.forEach((rep, idx) => { rh += `<div>📄 ${rep.filename} <button class="previewBtn" data-url="${rep.dataURL}" data-name="${rep.filename}">Preview</button> <button class="downloadBtn" data-url="${rep.dataURL}" data-name="${rep.filename}">Download</button> <button class="deleteFileBtn" data-idx="${idx}" style="background:#dc2626;">Delete</button></div>`; th += `<div>${rep.uploadTime || 'N/A'}</div>`; });
                 reportsCell.innerHTML = rh; timeCell.innerHTML = th;
                 reportsCell.querySelectorAll('.previewBtn').forEach(btn => btn.addEventListener('click',()=>showPdfModal(btn.dataset.url, btn.dataset.name)));
-                reportsCell.querySelectorAll('.downloadBtn').forEach(btn => btn.addEventListener('click',()=>{ const a=document.createElement("a"); a.href=btn.dataset.url; a.download=btn.dataset.name; a.click(); }));
+                
+                // In renderAdminTable, update the download button handler
+                reportsCell.querySelectorAll('.downloadBtn').forEach(btn => {
+                    btn.addEventListener('click', async () => { 
+                        const url = btn.dataset.url;
+                        const name = btn.dataset.name || 'report.pdf';
+                        
+                        if (url.startsWith('http')) {
+                            // If it's a storage URL, fetch and download
+                            try {
+                                const response = await fetch(url);
+                                const blob = await response.blob();
+                                const blobUrl = URL.createObjectURL(blob);
+                                const a = document.createElement("a"); 
+                                a.href = blobUrl; 
+                                a.download = name; 
+                                document.body.appendChild(a);
+                                a.click();
+                                document.body.removeChild(a);
+                                setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+                            } catch (error) {
+                                console.error("Download error:", error);
+                                showToast("Error downloading file");
+                            }
+                        } else {
+                            // Local dataURL
+                            const a = document.createElement("a"); 
+                            a.href = url; 
+                            a.download = name; 
+                            a.click(); 
+                        }
+                    });
+                });
+                                        
                 // In renderAdminTable function, update the delete file handler
                 reportsCell.querySelectorAll('.deleteFileBtn').forEach(btn => {
                     btn.addEventListener('click', async () => {
