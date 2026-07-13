@@ -480,12 +480,20 @@
                 .order('id', { ascending: true });
             if (patientsError) throw new Error(`Fetch patients error: ${patientsError.message}`);
             
-            // Fetch reports
+            // Fetch reports - handle potential missing columns gracefully
             const { data: reportsData, error: reportsError } = await supabaseClient
                 .from('reports')
                 .select('*')
                 .order('upload_time', { ascending: false });
-            if (reportsError) throw new Error(`Fetch reports error: ${reportsError.message}`);
+            if (reportsError) {
+                // If reports table doesn't have expected columns, try a simpler query
+                console.warn("Error fetching reports, trying simpler query:", reportsError);
+                const { data: simpleReports, error: simpleError } = await supabaseClient
+                    .from('reports')
+                    .select('patient_id, filename, data_url, upload_time, staff');
+                if (simpleError) throw new Error(`Fetch reports error: ${simpleError.message}`);
+                reportsData = simpleReports;
+            }
             
             // Fetch appointments
             const { data: appointmentsData, error: appointmentsError } = await supabaseClient
@@ -495,13 +503,13 @@
             
             console.log("Loaded from cloud:", {
                 patients: patientsData.length,
-                reports: reportsData.length,
+                reports: reportsData ? reportsData.length : 0,
                 appointments: appointmentsData.length
             });
             
             // Completely replace local data with cloud data
             const newPatients = patientsData.map(p => {
-                const patientReports = reportsData.filter(r => r.patient_id === p.id);
+                const patientReports = reportsData ? reportsData.filter(r => r.patient_id === p.id) : [];
                 const patientAppointment = appointmentsData.find(a => a.patient_id === p.id);
                 
                 return {
@@ -512,7 +520,7 @@
                     password: p.hkid_num || '',
                     reports: patientReports.map(r => ({
                         filename: r.filename || 'unknown.pdf',
-                        dataURL: r.data_url || '', // This is the storage URL
+                        dataURL: r.data_url || '',
                         uploadTime: r.upload_time || new Date().toISOString(),
                         staff: r.staff || '',
                         filePath: r.file_path || null
@@ -685,21 +693,36 @@
                         
                         // Only insert if we have a valid URL
                         if (storageUrl) {
-                            const { error: reportError } = await supabaseClient
-                                .from('reports')
-                                .insert({
-                                    patient_id: patient.id,
-                                    filename: report.filename || 'unknown.pdf',
-                                    data_url: storageUrl,
-                                    upload_time: report.uploadTime || new Date().toISOString(),
-                                    staff: report.staff || '',
-                                    file_path: filePath || null
-                                });
-                            if (reportError) {
-                                console.error("Report insert error:", reportError);
-                                throw new Error(`Insert report error: ${reportError.message}`);
+                            // Prepare the report data - only include columns that exist
+                            const reportData = {
+                                patient_id: patient.id,
+                                filename: report.filename || 'unknown.pdf',
+                                data_url: storageUrl,
+                                upload_time: report.uploadTime || new Date().toISOString(),
+                                staff: report.staff || ''
+                            };
+                            
+                            // Only add file_path if it exists (will be handled by the database)
+                            // The database will use default null if column doesn't exist
+                            try {
+                                const { error: reportError } = await supabaseClient
+                                    .from('reports')
+                                    .insert(reportData);
+                                if (reportError) {
+                                    console.error("Report insert error:", reportError);
+                                    throw new Error(`Insert report error: ${reportError.message}`);
+                                }
+                                reportInsertCount++;
+                            } catch (insertError) {
+                                // If insert fails, try without file_path
+                                console.warn("Insert with full data failed, trying without file_path");
+                                delete reportData.file_path;
+                                const { error: reportError } = await supabaseClient
+                                    .from('reports')
+                                    .insert(reportData);
+                                if (reportError) throw new Error(`Insert report error: ${reportError.message}`);
+                                reportInsertCount++;
                             }
-                            reportInsertCount++;
                         } else {
                             console.warn(`Skipping report ${report.filename} - no valid URL`);
                         }
@@ -1301,7 +1324,7 @@
         const container = document.getElementById("pdfReportsList");
         
         // Log for debugging
-        console.log("Loading patient reports:", pat);
+        console.log("Loading patient reports for patient:", pat);
         
         if(!pat) {
             container.innerHTML = '<p style="color: #64748B;">Patient data not found.</p>';
@@ -1314,6 +1337,7 @@
         }
         
         console.log(`Found ${pat.reports.length} reports for patient`);
+        console.log("Reports data:", pat.reports);
         
         container.innerHTML = "";
         
@@ -1326,11 +1350,14 @@
             const hasValidFile = rep.dataURL && rep.dataURL.length > 0;
             const fileType = rep.dataURL && rep.dataURL.startsWith('http') ? '☁️' : (rep.dataURL && rep.dataURL.startsWith('data:') ? '📄' : '⚠️');
             
+            // Show file info
+            const fileInfo = rep.dataURL ? `URL: ${rep.dataURL.substring(0, 60)}...` : 'No URL';
+            
             div.innerHTML = `
                 <span style="flex: 1; min-width: 150px;">
                     ${fileType} <strong>${rep.filename || 'report.pdf'}</strong>
                     <br><small style="color: #64748B;">Staff: ${rep.staff || 'N/A'} | Upload: ${rep.uploadTime || 'N/A'}</small>
-                    ${rep.dataURL ? `<br><small style="color: #64748B; font-size: 10px;">URL: ${rep.dataURL.substring(0, 50)}...</small>` : ''}
+                    <br><small style="color: #64748B; font-size: 10px;">${fileInfo}</small>
                 </span>
                 <div style="display: flex; gap: 8px; flex-wrap: wrap;">
                     <button class="previewP" data-url="${rep.dataURL || ''}" data-name="${rep.filename || 'report.pdf'}" style="font-size:12px; padding: 6px 14px; ${hasValidFile ? '' : 'opacity:0.5; cursor:not-allowed;'}" ${hasValidFile ? '' : 'disabled'}>
