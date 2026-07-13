@@ -559,6 +559,9 @@
             return false;
         }
         try {
+            console.log("Starting cloud sync...");
+            console.log("Patients to sync:", patients.length);
+            
             // Get current patient IDs from local data
             const localPatientIds = patients.map(p => p.id);
             
@@ -616,6 +619,8 @@
             
             // Now upsert all existing patients
             for (const patient of patients) {
+                console.log(`Syncing patient ${patient.id} with ${patient.reports.length} reports`);
+                
                 // Upsert patient
                 const { error: patientError } = await supabaseClient
                     .from('patients')
@@ -630,7 +635,6 @@
                 if (patientError) throw new Error(`Upsert patient error: ${patientError.message}`);
                 
                 // Handle reports - delete existing and re-insert
-                // First get existing reports to delete files
                 const { data: existingReports } = await supabaseClient
                     .from('reports')
                     .select('id, file_path')
@@ -653,25 +657,55 @@
                 if (deleteReportsError) throw new Error(`Delete reports error: ${deleteReportsError.message}`);
                 
                 // Insert fresh reports with storage URLs
+                let reportInsertCount = 0;
                 for (const report of patient.reports) {
                     if (report.dataURL) {
-                        // Upload file to storage
-                        const filePath = await uploadFileToStorage(patient.id, report.dataURL, report.filename);
+                        let storageUrl = report.dataURL;
+                        let filePath = null;
                         
-                        // Insert report record with storage URL
-                        const { error: reportError } = await supabaseClient
-                            .from('reports')
-                            .insert({
-                                patient_id: patient.id,
-                                filename: report.filename || 'unknown.pdf',
-                                data_url: filePath || '', // Store the storage URL
-                                upload_time: report.uploadTime || new Date().toISOString(),
-                                staff: report.staff || '',
-                                file_path: filePath ? `${patient.id}/${report.filename}` : null
-                            });
-                        if (reportError) throw new Error(`Insert report error: ${reportError.message}`);
+                        // If it's a dataURL (not a storage URL), upload to storage first
+                        if (report.dataURL.startsWith('data:')) {
+                            console.log(`Uploading report to storage: ${report.filename}`);
+                            storageUrl = await uploadFileToStorage(patient.id, report.dataURL, report.filename);
+                            filePath = storageUrl ? `${patient.id}/${report.filename}` : null;
+                            console.log(`Upload result: ${storageUrl}`);
+                        } else if (report.dataURL.startsWith('http')) {
+                            // It's already a storage URL, extract the file path
+                            try {
+                                const urlObj = new URL(report.dataURL);
+                                const pathParts = urlObj.pathname.split('/');
+                                const bucketIndex = pathParts.indexOf(storageBucket);
+                                if (bucketIndex !== -1) {
+                                    filePath = pathParts.slice(bucketIndex + 1).join('/');
+                                }
+                            } catch (e) {
+                                console.warn("Could not parse storage URL:", e);
+                            }
+                        }
+                        
+                        // Only insert if we have a valid URL
+                        if (storageUrl) {
+                            const { error: reportError } = await supabaseClient
+                                .from('reports')
+                                .insert({
+                                    patient_id: patient.id,
+                                    filename: report.filename || 'unknown.pdf',
+                                    data_url: storageUrl,
+                                    upload_time: report.uploadTime || new Date().toISOString(),
+                                    staff: report.staff || '',
+                                    file_path: filePath || null
+                                });
+                            if (reportError) {
+                                console.error("Report insert error:", reportError);
+                                throw new Error(`Insert report error: ${reportError.message}`);
+                            }
+                            reportInsertCount++;
+                        } else {
+                            console.warn(`Skipping report ${report.filename} - no valid URL`);
+                        }
                     }
                 }
+                console.log(`Inserted ${reportInsertCount} reports for patient ${patient.id}`);
                 
                 // Handle appointments
                 const { error: deleteApptError } = await supabaseClient
@@ -696,6 +730,7 @@
             
             saveData();
             const totalReports = patients.reduce((sum, p) => sum + p.reports.length, 0);
+            console.log(`Sync complete: ${patients.length} patients, ${totalReports} reports`);
             showToast(`Synced ${patients.length} patients, ${totalReports} reports to cloud`);
             return true;
         } catch (error) {
@@ -896,6 +931,7 @@
             row.insertCell(1).innerText = patient.hkidNum; 
             row.insertCell(2).innerHTML = patient.emails.join(', ');
             
+            // In renderAdminTable function, replace the reports cell section
             const reportsCell = row.insertCell(3);
             const timeCell = row.insertCell(4);
             
@@ -909,13 +945,22 @@
                     // Staff badge
                     const staffText = rep.staff ? ` <span class="staff-badge">${rep.staff}</span>` : "";
                     
-                    // File size indicator
-                    const fileType = rep.dataURL && rep.dataURL.startsWith('http') ? '☁️' : '📄';
+                    // File type indicator
+                    const fileType = rep.dataURL && rep.dataURL.startsWith('http') ? '☁️' : (rep.dataURL && rep.dataURL.startsWith('data:') ? '📄' : '⚠️');
+                    
+                    // Show preview button only if file exists
+                    const previewBtn = hasValidFile ? 
+                        `<button class="previewBtn" data-url="${rep.dataURL}" data-name="${fileDisplayName}" style="font-size:11px; padding:4px 12px; margin:2px;">Preview</button>` :
+                        `<button style="font-size:11px; padding:4px 12px; margin:2px; opacity:0.5;" disabled>Preview</button>`;
+                    
+                    const downloadBtn = hasValidFile ?
+                        `<button class="downloadBtn" data-url="${rep.dataURL}" data-name="${fileDisplayName}" style="font-size:11px; padding:4px 12px;">Download</button>` :
+                        `<button style="font-size:11px; padding:4px 12px; opacity:0.5;" disabled>Download</button>`;
                     
                     rh += `<div style="margin-bottom:10px; padding:6px; background:#f8fafc; border-radius:8px;">
-                        ${fileType} ${fileDisplayName}${staffText}<br>
-                        <button class="previewBtn" data-url="${rep.dataURL || ''}" data-name="${fileDisplayName}" style="font-size:11px; padding:4px 12px; margin:2px;">Preview</button>
-                        <button class="downloadBtn" data-url="${rep.dataURL || ''}" data-name="${fileDisplayName}" style="font-size:11px; padding:4px 12px;">Download</button>
+                        ${fileType} <strong>${fileDisplayName}</strong>${staffText}<br>
+                        ${previewBtn}
+                        ${downloadBtn}
                         <button class="deleteFileBtn" data-idx="${idx}" style="font-size:11px; padding:4px 12px; background:#dc2626;">Delete</button>
                     </div>`; 
                     th += `<div style="margin-bottom:12px;">${rep.uploadTime || 'N/A'}</div>`; 
@@ -962,7 +1007,7 @@
                                 a.click();
                                 document.body.removeChild(a);
                                 setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-                            } else {
+                            } else if (url.startsWith('data:')) {
                                 // For dataURLs, direct download
                                 const a = document.createElement("a"); 
                                 a.href = url; 
@@ -970,6 +1015,8 @@
                                 document.body.appendChild(a);
                                 a.click();
                                 document.body.removeChild(a);
+                            } else {
+                                showToast("Invalid file format");
                             }
                         } catch (error) {
                             console.error("Download error:", error);
@@ -989,6 +1036,7 @@
                             saveData();
                             const result = await saveDataToCloudWithRetry(3);
                             if (result) {
+                                await loadDataFromCloud();
                                 renderAdminTable();
                                 showToast(`File "${filename}" deleted and synced to cloud!`);
                             } else {
@@ -1152,7 +1200,6 @@
             let uploadCount = 0;
             const totalFiles = files.length;
             let uploadErrors = [];
-            let uploadedReports = [];
             
             Array.from(files).forEach(file => { 
                 if(file.type === "application/pdf") { 
@@ -1168,10 +1215,10 @@
                             // Upload to Supabase Storage and get public URL
                             const publicUrl = await uploadFileToStorage(patient.id, dataURL, finalName);
                             
-                            // Use the public URL if available, otherwise keep the dataURL
+                            // IMPORTANT: Create report with the storage URL
                             const reportData = { 
                                 filename: finalName, 
-                                dataURL: publicUrl || dataURL, // Storage URL or dataURL
+                                dataURL: publicUrl || dataURL, // Use storage URL if available
                                 uploadTime: now, 
                                 staff: staff,
                                 filePath: publicUrl ? `${patient.id}/${finalName}` : null
@@ -1179,16 +1226,15 @@
                             
                             // Add to patient's reports
                             patient.reports.push(reportData); 
-                            uploadedReports.push(reportData);
                             
-                            // Save locally
+                            // Save locally immediately
                             saveData(); 
                             
                             uploadCount++;
                             
                             // When all files are processed, sync to cloud
                             if (uploadCount === totalFiles) {
-                                // Sync to cloud with retry
+                                // Force sync to cloud
                                 const syncResult = await saveDataToCloudWithRetry(3);
                                 if (syncResult) {
                                     // Reload from cloud to ensure data consistency
@@ -1201,8 +1247,9 @@
                                         loadPatientReports();
                                     }
                                 } else {
+                                    // Even if cloud sync fails, show the reports locally
                                     renderAdminTable();
-                                    showToast("Files saved locally but cloud sync failed. Please use 'Sync to Cloud' button.");
+                                    showToast("Files saved locally. Cloud sync will complete when you press 'Sync to Cloud'.");
                                 }
                             }
                         } catch (error) {
@@ -1253,6 +1300,9 @@
         const pat = patients.find(p => p.id === currentUser.patientId);
         const container = document.getElementById("pdfReportsList");
         
+        // Log for debugging
+        console.log("Loading patient reports:", pat);
+        
         if(!pat) {
             container.innerHTML = '<p style="color: #64748B;">Patient data not found.</p>';
             return;
@@ -1262,6 +1312,8 @@
             container.innerHTML = '<p style="color: #64748B;">No reports available. Please contact your clinic.</p>';
             return;
         }
+        
+        console.log(`Found ${pat.reports.length} reports for patient`);
         
         container.innerHTML = "";
         
@@ -1278,6 +1330,7 @@
                 <span style="flex: 1; min-width: 150px;">
                     ${fileType} <strong>${rep.filename || 'report.pdf'}</strong>
                     <br><small style="color: #64748B;">Staff: ${rep.staff || 'N/A'} | Upload: ${rep.uploadTime || 'N/A'}</small>
+                    ${rep.dataURL ? `<br><small style="color: #64748B; font-size: 10px;">URL: ${rep.dataURL.substring(0, 50)}...</small>` : ''}
                 </span>
                 <div style="display: flex; gap: 8px; flex-wrap: wrap;">
                     <button class="previewP" data-url="${rep.dataURL || ''}" data-name="${rep.filename || 'report.pdf'}" style="font-size:12px; padding: 6px 14px; ${hasValidFile ? '' : 'opacity:0.5; cursor:not-allowed;'}" ${hasValidFile ? '' : 'disabled'}>
@@ -1370,6 +1423,29 @@
             showToast("Appointment confirmed! WhatsApp sent to admin.");
         };
     }
+
+    // Debug function to check patient data
+    function debugPatientData() {
+        console.log("===== DEBUG PATIENT DATA =====");
+        console.log("Total patients:", patients.length);
+        patients.forEach((p, idx) => {
+            console.log(`Patient ${idx + 1}:`, {
+                id: p.id,
+                hkidNum: p.hkidNum,
+                mobiles: p.mobiles,
+                reportsCount: p.reports.length,
+                reports: p.reports.map(r => ({
+                    filename: r.filename,
+                    dataURL: r.dataURL ? r.dataURL.substring(0, 100) + '...' : 'null',
+                    uploadTime: r.uploadTime,
+                    staff: r.staff
+                }))
+            });
+        });
+        console.log("===== END DEBUG =====");
+    }
+    
+    // Call this function from browser console to debug: debugPatientData()
     
     function confirmLogout() { 
         const overlay = document.createElement("div"); 
