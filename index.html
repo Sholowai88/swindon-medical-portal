@@ -397,7 +397,10 @@
             
             // Create unique file path: patient_id/timestamp_filename.pdf
             const timestamp = Date.now();
-            const filePath = `${patientId}/${timestamp}_${filename}`;
+            const safeFilename = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+            const filePath = `${patientId}/${timestamp}_${safeFilename}`;
+            
+            console.log("Uploading to storage:", filePath);
             
             // Upload to Supabase Storage
             const { data, error } = await supabaseClient.storage
@@ -413,12 +416,14 @@
                 throw error;
             }
             
+            console.log("Upload successful:", data);
+            
             // Get public URL
             const { data: urlData } = supabaseClient.storage
                 .from(storageBucket)
                 .getPublicUrl(filePath);
             
-            console.log("File uploaded to storage. Public URL:", urlData.publicUrl);
+            console.log("Public URL:", urlData.publicUrl);
             return urlData.publicUrl;
             
         } catch (error) {
@@ -488,6 +493,12 @@
                 .select('*');
             if (appointmentsError) throw new Error(`Fetch appointments error: ${appointmentsError.message}`);
             
+            console.log("Loaded from cloud:", {
+                patients: patientsData.length,
+                reports: reportsData.length,
+                appointments: appointmentsData.length
+            });
+            
             // Completely replace local data with cloud data
             const newPatients = patientsData.map(p => {
                 const patientReports = reportsData.filter(r => r.patient_id === p.id);
@@ -501,11 +512,10 @@
                     password: p.hkid_num || '',
                     reports: patientReports.map(r => ({
                         filename: r.filename || 'unknown.pdf',
-                        // If data_url is a storage URL, we keep it as the source
-                        dataURL: r.data_url || '',
+                        dataURL: r.data_url || '', // This is the storage URL
                         uploadTime: r.upload_time || new Date().toISOString(),
                         staff: r.staff || '',
-                        filePath: r.file_path || null // Store for deletion
+                        filePath: r.file_path || null
                     })),
                     appointment: patientAppointment ? {
                         datetime: patientAppointment.datetime || '',
@@ -526,6 +536,12 @@
             
             saveData();
             renderAdminTable();
+            
+            // If patient is logged in, reload their reports
+            if (currentUser && currentUser.role === 'patient') {
+                loadPatientReports();
+            }
+            
             const totalReports = patients.reduce((sum, p) => sum + p.reports.length, 0);
             showToast(`Loaded ${patients.length} patients, ${totalReports} reports from cloud!`);
             return true;
@@ -744,22 +760,35 @@
             .subscribe();
     }
 
-    // Multi-page PDF viewer with zoom and page selection
+   // Multi-page PDF viewer with zoom and page selection
     async function showPdfModal(dataURL, filename) {
+        if (!dataURL || dataURL.length === 0) {
+            showToast("No PDF data available");
+            return;
+        }
+        
         let pdfSource = dataURL;
         
         // If dataURL is a storage URL (starts with http), fetch it as blob
-        if (dataURL && dataURL.startsWith('http')) {
+        if (dataURL.startsWith('http')) {
             try {
+                console.log("Fetching PDF from storage:", dataURL);
                 const response = await fetch(dataURL);
-                if (!response.ok) throw new Error('Failed to fetch PDF');
+                if (!response.ok) throw new Error('Failed to fetch PDF from storage');
                 const blob = await response.blob();
                 pdfSource = URL.createObjectURL(blob);
+                console.log("PDF fetched successfully");
             } catch (error) {
                 console.error("Error fetching PDF from storage:", error);
                 showToast("Error loading PDF from cloud storage. Please try again.");
                 return;
             }
+        } else if (dataURL.startsWith('data:')) {
+            // Data URL - use directly
+            console.log("Using data URL directly");
+        } else {
+            showToast("Invalid file format");
+            return;
         }
         
         const modalDiv = document.createElement("div"); 
@@ -787,8 +816,10 @@
         let pdfDoc = null, currentPage = 1, scale = 1.5;
         
         try {
+            console.log("Loading PDF with pdf.js");
             const loadingTask = pdfjsLib.getDocument(pdfSource);
             pdfDoc = await loadingTask.promise;
+            console.log("PDF loaded, pages:", pdfDoc.numPages);
             
             const renderPage = async (pageNum) => { 
                 const page = await pdfDoc.getPage(pageNum); 
@@ -1137,10 +1168,10 @@
                             // Upload to Supabase Storage and get public URL
                             const publicUrl = await uploadFileToStorage(patient.id, dataURL, finalName);
                             
-                            // Create report object with the storage URL
+                            // Use the public URL if available, otherwise keep the dataURL
                             const reportData = { 
                                 filename: finalName, 
-                                dataURL: publicUrl || dataURL, // Use storage URL if available, fallback to dataURL
+                                dataURL: publicUrl || dataURL, // Storage URL or dataURL
                                 uploadTime: now, 
                                 staff: staff,
                                 filePath: publicUrl ? `${patient.id}/${finalName}` : null
@@ -1160,6 +1191,8 @@
                                 // Sync to cloud with retry
                                 const syncResult = await saveDataToCloudWithRetry(3);
                                 if (syncResult) {
+                                    // Reload from cloud to ensure data consistency
+                                    await loadDataFromCloud();
                                     renderAdminTable(); 
                                     showToast(`Uploaded ${totalFiles} file(s) successfully!`);
                                     
@@ -1220,19 +1253,26 @@
         const pat = patients.find(p => p.id === currentUser.patientId);
         const container = document.getElementById("pdfReportsList");
         
-        if(!pat || !pat.reports || pat.reports.length === 0) {
+        if(!pat) {
+            container.innerHTML = '<p style="color: #64748B;">Patient data not found.</p>';
+            return;
+        }
+        
+        if(!pat.reports || pat.reports.length === 0) {
             container.innerHTML = '<p style="color: #64748B;">No reports available. Please contact your clinic.</p>';
             return;
         }
         
         container.innerHTML = "";
         
-        pat.reports.forEach(rep => {
+        pat.reports.forEach((rep, index) => {
             const div = document.createElement("div");
             div.className = "file-list-item";
             div.style.cssText = "background: #f8fafc; padding: 12px 16px; margin: 8px 0; border-radius: 18px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; border: 1px solid #eef2ff;";
             
-            const fileType = rep.dataURL && rep.dataURL.startsWith('http') ? '☁️' : '📄';
+            // Check if the dataURL is a storage URL or dataURL
+            const hasValidFile = rep.dataURL && rep.dataURL.length > 0;
+            const fileType = rep.dataURL && rep.dataURL.startsWith('http') ? '☁️' : (rep.dataURL && rep.dataURL.startsWith('data:') ? '📄' : '⚠️');
             
             div.innerHTML = `
                 <span style="flex: 1; min-width: 150px;">
@@ -1240,8 +1280,12 @@
                     <br><small style="color: #64748B;">Staff: ${rep.staff || 'N/A'} | Upload: ${rep.uploadTime || 'N/A'}</small>
                 </span>
                 <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-                    <button class="previewP" data-url="${rep.dataURL || ''}" data-name="${rep.filename || 'report.pdf'}" style="font-size:12px; padding: 6px 14px;">Preview</button>
-                    <button class="downloadP" data-url="${rep.dataURL || ''}" data-name="${rep.filename || 'report.pdf'}" style="font-size:12px; padding: 6px 14px;">Download</button>
+                    <button class="previewP" data-url="${rep.dataURL || ''}" data-name="${rep.filename || 'report.pdf'}" style="font-size:12px; padding: 6px 14px; ${hasValidFile ? '' : 'opacity:0.5; cursor:not-allowed;'}" ${hasValidFile ? '' : 'disabled'}>
+                        Preview
+                    </button>
+                    <button class="downloadP" data-url="${rep.dataURL || ''}" data-name="${rep.filename || 'report.pdf'}" style="font-size:12px; padding: 6px 14px; ${hasValidFile ? '' : 'opacity:0.5; cursor:not-allowed;'}" ${hasValidFile ? '' : 'disabled'}>
+                        Download
+                    </button>
                 </div>
             `;
             container.appendChild(div);
@@ -1253,11 +1297,13 @@
                 const url = btn.dataset.url;
                 const name = btn.dataset.name || 'report.pdf';
                 
-                if (url && url.length > 0) {
-                    await showPdfModal(url, name);
-                } else {
-                    showToast("Report file not available.");
+                if (!url || url.length === 0) {
+                    showToast("Report file not available. Please contact your clinic.");
+                    return;
                 }
+                
+                console.log("Previewing report:", { url, name });
+                await showPdfModal(url, name);
             });
         });
         
@@ -1268,12 +1314,15 @@
                 const name = btn.dataset.name || 'report.pdf';
                 
                 if (!url || url.length === 0) {
-                    showToast("Report file not available.");
+                    showToast("Report file not available. Please contact your clinic.");
                     return;
                 }
                 
                 try {
+                    console.log("Downloading report:", { url, name });
+                    
                     if (url.startsWith('http')) {
+                        // For storage URLs
                         const response = await fetch(url);
                         if (!response.ok) throw new Error('Network response was not ok');
                         const blob = await response.blob();
@@ -1285,13 +1334,16 @@
                         a.click();
                         document.body.removeChild(a);
                         setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-                    } else {
+                    } else if (url.startsWith('data:')) {
+                        // For dataURLs
                         const a = document.createElement("a");
                         a.href = url;
                         a.download = name;
                         document.body.appendChild(a);
                         a.click();
                         document.body.removeChild(a);
+                    } else {
+                        showToast("Invalid file format");
                     }
                 } catch (error) {
                     console.error("Download error:", error);
@@ -1414,8 +1466,14 @@
                     const result = await saveDataToCloudWithRetry(3);
                     
                     if (result) {
-                        // After sync, verify by loading from cloud
+                        // After sync, force reload from cloud
                         await loadDataFromCloud();
+                        
+                        // Also reload patient reports if patient is logged in
+                        if (currentUser && currentUser.role === 'patient') {
+                            loadPatientReports();
+                        }
+                        
                         showToast("Data fully synchronized with cloud!");
                     } else {
                         showToast("Sync failed after multiple attempts. Please try again.");
