@@ -417,37 +417,42 @@
                 .select('*');
             if (appointmentsError) throw appointmentsError;
             
-            // Combine data
-            patients = patientsData.map(p => {
+            // Completely replace local data with cloud data
+            const newPatients = patientsData.map(p => {
                 const patientReports = reportsData.filter(r => r.patient_id === p.id);
                 const patientAppointment = appointmentsData.find(a => a.patient_id === p.id);
                 return {
                     id: p.id,
-                    hkidNum: p.hkid_num,
+                    hkidNum: p.hkid_num || '',
                     mobiles: p.mobiles || [],
                     emails: p.emails || [],
-                    password: p.password,
+                    password: p.hkid_num || '',
                     reports: patientReports.map(r => ({
-                        filename: r.filename,
-                        dataURL: r.data_url,
-                        uploadTime: r.upload_time,
-                        staff: r.staff
+                        filename: r.filename || 'unknown.pdf',
+                        dataURL: r.data_url || '',
+                        uploadTime: r.upload_time || new Date().toISOString(),
+                        staff: r.staff || ''
                     })),
                     appointment: patientAppointment ? {
-                        datetime: patientAppointment.datetime,
-                        status: patientAppointment.status,
-                        updateCount: patientAppointment.update_count
+                        datetime: patientAppointment.datetime || '',
+                        status: patientAppointment.status || 'pending',
+                        updateCount: patientAppointment.update_count || 0
                     } : { datetime: "", status: "pending", updateCount: 0 }
                 };
             });
             
+            // Replace the patients array completely
+            patients = newPatients;
+            
             if (patients.length > 0) {
                 nextPatientId = Math.max(...patients.map(p => p.id)) + 1;
+            } else {
+                nextPatientId = 100;
             }
             
             saveData();
             renderAdminTable();
-            showToast("Data loaded from cloud!");
+            showToast(`Loaded ${patients.length} patients from cloud!`);
             return true;
         } catch (error) {
             console.error("Cloud load error:", error);
@@ -463,60 +468,95 @@
             return false;
         }
         try {
-            for (const patient of patients) {
-                // Ensure hkidNum is properly saved
-                const hkidValue = patient.hkidNum || '';
+            // Get current patient IDs from local data
+            const localPatientIds = patients.map(p => p.id);
+            
+            // Get all patients from cloud
+            const { data: cloudPatients, error: fetchError } = await supabaseClient
+                .from('patients')
+                .select('id');
+            
+            if (fetchError) throw fetchError;
+            
+            // Find patients to delete (in cloud but not in local)
+            const cloudPatientIds = cloudPatients.map(p => p.id);
+            const toDeleteIds = cloudPatientIds.filter(id => !localPatientIds.includes(id));
+            
+            // Delete patients that no longer exist locally
+            for (const deleteId of toDeleteIds) {
+                // Delete reports first
+                const { error: reportDeleteError } = await supabaseClient
+                    .from('reports')
+                    .delete()
+                    .eq('patient_id', deleteId);
+                if (reportDeleteError) throw reportDeleteError;
                 
+                // Delete appointments
+                const { error: apptDeleteError } = await supabaseClient
+                    .from('appointments')
+                    .delete()
+                    .eq('patient_id', deleteId);
+                if (apptDeleteError) throw apptDeleteError;
+                
+                // Delete patient
+                const { error: patientDeleteError } = await supabaseClient
+                    .from('patients')
+                    .delete()
+                    .eq('id', deleteId);
+                if (patientDeleteError) throw patientDeleteError;
+                
+                console.log(`Deleted patient ${deleteId} from cloud`);
+            }
+            
+            // Now upsert all existing patients
+            for (const patient of patients) {
                 // Upsert patient
                 const { error: patientError } = await supabaseClient
                     .from('patients')
                     .upsert({
                         id: patient.id,
-                        hkid_num: hkidValue,
-                        mobiles: patient.mobiles,
+                        hkid_num: patient.hkidNum || '',
+                        mobiles: patient.mobiles || [],
                         emails: patient.emails || [],
-                        password: hkidValue,
+                        password: patient.hkidNum || '',
                         updated_at: new Date().toISOString()
                     });
                 if (patientError) throw patientError;
                 
-                // Save reports with dataURL handling
+                // Handle reports - delete existing and re-insert
+                const { error: deleteReportsError } = await supabaseClient
+                    .from('reports')
+                    .delete()
+                    .eq('patient_id', patient.id);
+                if (deleteReportsError) throw deleteReportsError;
+                
+                // Insert fresh reports
                 for (const report of patient.reports) {
-                    // Check if report already exists in cloud
-                    const { data: existingReport } = await supabaseClient
-                        .from('reports')
-                        .select('id')
-                        .eq('patient_id', patient.id)
-                        .eq('filename', report.filename)
-                        .maybeSingle();
-                    
-                    const reportData = {
-                        patient_id: patient.id,
-                        filename: report.filename,
-                        data_url: report.dataURL,
-                        upload_time: report.uploadTime || new Date().toISOString(),
-                        staff: report.staff || ''
-                    };
-                    
-                    if (existingReport) {
+                    if (report.dataURL) {
                         const { error: reportError } = await supabaseClient
                             .from('reports')
-                            .update(reportData)
-                            .eq('id', existingReport.id);
-                        if (reportError) throw reportError;
-                    } else {
-                        const { error: reportError } = await supabaseClient
-                            .from('reports')
-                            .insert(reportData);
+                            .insert({
+                                patient_id: patient.id,
+                                filename: report.filename,
+                                data_url: report.dataURL,
+                                upload_time: report.uploadTime || new Date().toISOString(),
+                                staff: report.staff || ''
+                            });
                         if (reportError) throw reportError;
                     }
                 }
                 
-                // Save appointment
-                if (patient.appointment) {
+                // Handle appointments - delete existing and re-insert
+                const { error: deleteApptError } = await supabaseClient
+                    .from('appointments')
+                    .delete()
+                    .eq('patient_id', patient.id);
+                if (deleteApptError) throw deleteApptError;
+                
+                if (patient.appointment && patient.appointment.datetime) {
                     const { error: apptError } = await supabaseClient
                         .from('appointments')
-                        .upsert({
+                        .insert({
                             patient_id: patient.id,
                             datetime: patient.appointment.datetime || null,
                             status: patient.appointment.status || 'pending',
@@ -528,11 +568,11 @@
             }
             
             saveData();
-            showToast("Data synced to cloud!");
+            showToast(`Synced ${patients.length} patients to cloud`);
             return true;
         } catch (error) {
             console.error("Cloud save error:", error);
-            showToast("Cloud save failed, data saved locally");
+            showToast("Cloud save failed: " + error.message);
             saveData();
             return false;
         }
@@ -602,7 +642,28 @@
                 reportsCell.innerHTML = rh; timeCell.innerHTML = th;
                 reportsCell.querySelectorAll('.previewBtn').forEach(btn => btn.addEventListener('click',()=>showPdfModal(btn.dataset.url, btn.dataset.name)));
                 reportsCell.querySelectorAll('.downloadBtn').forEach(btn => btn.addEventListener('click',()=>{ const a=document.createElement("a"); a.href=btn.dataset.url; a.download=btn.dataset.name; a.click(); }));
-                reportsCell.querySelectorAll('.deleteFileBtn').forEach(btn => btn.addEventListener('click',()=>{ const idx=parseInt(btn.dataset.idx); patient.reports.splice(idx,1); saveData(); renderAdminTable(); showToast("File deleted"); }));
+                // In renderAdminTable function, update the delete file handler
+                reportsCell.querySelectorAll('.deleteFileBtn').forEach(btn => {
+                    btn.addEventListener('click', async () => {
+                        const idx = parseInt(btn.dataset.idx);
+                        const filename = patient.reports[idx]?.filename || 'file';
+                        
+                        if(confirm(`Delete file "${filename}"?`)) {
+                            patient.reports.splice(idx, 1);
+                            saveData();
+                            
+                            // Sync to cloud
+                            const result = await saveDataToCloud();
+                            if (result) {
+                                renderAdminTable();
+                                showToast(`File "${filename}" deleted and synced to cloud!`);
+                            } else {
+                                renderAdminTable();
+                                showToast("File deleted locally but cloud sync failed. Use Sync button to retry.");
+                            }
+                        }
+                    });
+                });                         
             } else { reportsCell.innerText = "—"; timeCell.innerText = "—"; }
             row.insertCell(5).innerText = patient.appointment?.datetime || "Not set"; row.insertCell(6).innerText = patient.appointment?.updateCount || 0;
             const statusCell = row.insertCell(7); const statusVal = patient.appointment?.status || "pending"; const badge = document.createElement("span"); badge.className = `badge ${statusVal==="confirmed"?"confirmed":"pending"}`; badge.innerText = statusVal==="confirmed"?"Confirmed":"Pending"; statusCell.appendChild(badge);
@@ -610,7 +671,27 @@
             const waIcon = document.createElement("i"); waIcon.className="fab fa-whatsapp"; waIcon.style.color="#25D366"; waIcon.onclick=()=>sendWhatsAppSecure(patient);
             const mailIcon = document.createElement("i"); mailIcon.className="fas fa-envelope"; mailIcon.style.color="#ea4335"; mailIcon.onclick=()=>sendEmailSecure(patient);
             const editIcon = document.createElement("i"); editIcon.className="fas fa-edit"; editIcon.onclick=()=>openEditModal(patient);
-            const delIcon = document.createElement("i"); delIcon.className="fas fa-trash-alt"; delIcon.style.color="#b91c1c"; delIcon.onclick=()=>{ if(confirm("Delete patient?")) { patients=patients.filter(p=>p.id!==patient.id); saveData(); renderAdminTable(); } };
+            // In renderAdminTable function, update the delete icon handler
+            const delIcon = document.createElement("i"); 
+            delIcon.className = "fas fa-trash-alt"; 
+            delIcon.style.color = "#b91c1c"; 
+            delIcon.onclick = async () => { 
+                if(confirm(`Delete patient ${patient.mobiles.join(', ')}? This will permanently remove all data.`)) { 
+                    // Remove from local array
+                    patients = patients.filter(p => p.id !== patient.id); 
+                    saveData(); 
+                    
+                    // Sync deletion to cloud
+                    const result = await saveDataToCloud();
+                    if (result) {
+                        renderAdminTable(); 
+                        showToast("Patient deleted and synced to cloud!");
+                    } else {
+                        renderAdminTable();
+                        showToast("Patient deleted locally but cloud sync failed. Use Sync button to retry.");
+                    }
+                } 
+            };
             actionCell.append(waIcon, mailIcon, editIcon, delIcon);
         });
         if(pendingNotification) { showToast("📢 New appointment update detected!"); pendingNotification=false; }
@@ -676,7 +757,7 @@
     function createOrUpdatePatient() { 
         const mobiles = document.getElementById("patientMobiles").value.split(',').map(s=>s.trim()).filter(s=>s); 
         const hkidRaw = document.getElementById("patientHkidNum").value.trim();
-        const hkidNum = extractHkid(hkidRaw); // Updated to include letters
+        const hkidNum = extractHkid(hkidRaw);
         const emails = document.getElementById("patientEmails").value.split(',').map(s=>s.trim()).filter(s=>s); 
         const accession = document.getElementById("accessionNumber").value; 
         const staff = document.getElementById("reportingStaff").value; 
@@ -687,6 +768,7 @@
             return; 
         }
         
+        // Check if patient exists
         let patient = patients.find(p => p.hkidNum === hkidNum); 
         if(patient) { 
             patient.mobiles = [...new Set([...patient.mobiles, ...mobiles])]; 
@@ -706,56 +788,69 @@
         }
         
         // Handle file uploads with proper cloud sync
-        if(files.length){ 
-            let uploadPromises = [];
-            Array.from(files).forEach(file=>{ 
-                if(file.type==="application/pdf"){ 
-                    const promise = new Promise((resolve) => {
-                        const reader=new FileReader(); 
-                        reader.onload=function(e){ 
-                            const finalName = accession ? `${accession}.pdf` : file.name; 
-                            const now = new Date().toLocaleString('zh-HK'); 
-                            const reportData = { 
-                                filename: finalName, 
-                                dataURL: e.target.result, 
-                                uploadTime: now, 
-                                staff: staff 
-                            };
-                            patient.reports.push(reportData); 
-                            saveData(); 
-                            // Sync to cloud immediately
+        if(files && files.length > 0){ 
+            let uploadCount = 0;
+            const totalFiles = files.length;
+            
+            Array.from(files).forEach(file => { 
+                if(file.type === "application/pdf") { 
+                    const reader = new FileReader(); 
+                    reader.onload = function(e) { 
+                        const finalName = accession ? `${accession}.pdf` : file.name; 
+                        const now = new Date().toLocaleString('zh-HK'); 
+                        
+                        // Add report to patient data
+                        const reportData = { 
+                            filename: finalName, 
+                            dataURL: e.target.result, 
+                            uploadTime: now, 
+                            staff: staff 
+                        };
+                        patient.reports.push(reportData); 
+                        
+                        // Save locally
+                        saveData(); 
+                        
+                        uploadCount++;
+                        
+                        // When all files are processed, sync to cloud
+                        if (uploadCount === totalFiles) {
+                            // Async sync to cloud
                             saveDataToCloud().then(() => {
                                 renderAdminTable(); 
-                                showToast(`Uploaded: ${finalName}`);
-                                resolve();
+                                showToast(`Uploaded ${totalFiles} file(s): ${finalName}`);
+                            }).catch(err => {
+                                console.error("Cloud sync error:", err);
+                                renderAdminTable();
+                                showToast("Files saved locally but cloud sync failed. Try Sync button.");
                             });
-                        }; 
-                        reader.readAsDataURL(file);
-                    });
-                    uploadPromises.push(promise);
+                        }
+                    }; 
+                    reader.onerror = function() {
+                        showToast("Error reading file: " + file.name);
+                    };
+                    reader.readAsDataURL(file); 
                 } else { 
                     alert("Only PDF files are allowed"); 
                 } 
             });
             
-            // Wait for all uploads to complete
-            Promise.all(uploadPromises).then(() => {
-                renderAdminTable();
-                showToast("All files uploaded and synced to cloud!");
-            });
+            // Clear file input after processing
+            document.getElementById("reportPdfFile").value = "";
         } else { 
+            // No files, just save data
             saveData(); 
             saveDataToCloud().then(() => {
                 renderAdminTable(); 
+                showToast("Patient data saved and synced to cloud!");
             });
         }
         
-        // Clear form fields
-        document.getElementById("patientMobiles").value=""; 
-        document.getElementById("patientHkidNum").value=""; 
-        document.getElementById("patientEmails").value=""; 
-        document.getElementById("accessionNumber").value=""; 
-        document.getElementById("reportPdfFile").value=""; 
+        // Clear form fields (but keep the data processing running)
+        document.getElementById("patientMobiles").value = ""; 
+        document.getElementById("patientHkidNum").value = ""; 
+        document.getElementById("patientEmails").value = ""; 
+        document.getElementById("accessionNumber").value = ""; 
     }
     function exportToExcel() { const data=patients.map(p=>({ MobileNumbers: p.mobiles.join(';'), HKID: p.hkidNum, Emails: p.emails.join(';'), Reports: p.reports.map(r=>r.filename).join("; "), Appointment: p.appointment?.datetime, Status: p.appointment?.status })); const ws=XLSX.utils.json_to_sheet(data); const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,"Patients"); XLSX.writeFile(wb,`Patients_${Date.now()}.xlsx`); }
     function showToast(msg){ const t=document.createElement("div"); t.className="toast"; t.innerText=msg; document.body.appendChild(t); setTimeout(()=>t.remove(),2500); }
@@ -858,7 +953,22 @@
             document.getElementById("clearSearchBtn").onclick=()=>{ document.getElementById("searchMobile").value=""; document.getElementById("searchHkid").value=""; document.getElementById("searchEmail").value=""; renderAdminTable(); }; 
             document.getElementById("updateRecordsBtn").onclick=()=>{ renderAdminTable(); showToast("Records refreshed"); }; 
             document.getElementById("saveAllBtn").onclick=()=>{ saveData(); saveDataToCloud(); showToast("All settings and records saved!"); }; 
-            document.getElementById("syncCloudBtn").onclick=async()=>{ await saveDataToCloud(); await loadDataFromCloud(); };
+            // Update the sync button handler to properly delete records
+            document.getElementById("syncCloudBtn").onclick = async () => {
+                // First, ensure local data is saved
+                saveData();
+                
+                // Then sync to cloud - this will handle deletions
+                const result = await saveDataToCloud();
+                
+                if (result) {
+                    // After sync, verify by loading from cloud
+                    await loadDataFromCloud();
+                    showToast("Data fully synchronized with cloud!");
+                } else {
+                    showToast("Sync failed. Please try again.");
+                }
+            };
             document.getElementById("searchMobile").addEventListener("input",renderAdminTable); 
             document.getElementById("searchHkid").addEventListener("input",renderAdminTable); 
             document.getElementById("searchEmail").addEventListener("input",renderAdminTable); 
