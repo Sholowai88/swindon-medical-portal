@@ -378,6 +378,30 @@
         // Remove spaces and take first 4 characters (including letters)
         return input.replace(/\s/g, '').substring(0,4).toUpperCase(); 
     }
+
+    // Helper function to format date for Supabase
+    function formatDateForSupabase(date) {
+        if (!date) return new Date().toISOString();
+        try {
+            // If it's already a string, try to parse it
+            if (typeof date === 'string') {
+                // If it's already ISO format, return it
+                if (date.includes('T')) return date;
+                // Try to parse it
+                const parsed = new Date(date);
+                if (!isNaN(parsed.getTime())) {
+                    return parsed.toISOString();
+                }
+            }
+            // If it's a Date object
+            if (date instanceof Date && !isNaN(date.getTime())) {
+                return date.toISOString();
+            }
+            return new Date().toISOString();
+        } catch (e) {
+            return new Date().toISOString();
+        }
+    }
     
     function saveData() { localStorage.setItem("swindon_patients_v10", JSON.stringify(patients)); }
     
@@ -393,14 +417,22 @@
         try {
             // Convert dataURL to Blob
             const response = await fetch(dataURL);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch dataURL: ${response.status}`);
+            }
             const blob = await response.blob();
+            
+            // Validate blob size (max 50MB)
+            if (blob.size > 50 * 1024 * 1024) {
+                throw new Error("File size exceeds 50MB limit");
+            }
             
             // Create unique file path: patient_id/timestamp_filename.pdf
             const timestamp = Date.now();
             const safeFilename = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
             const filePath = `${patientId}/${timestamp}_${safeFilename}`;
             
-            console.log("Uploading to storage:", filePath);
+            console.log("Uploading to storage:", { bucket: storageBucket, filePath, size: blob.size });
             
             // Upload to Supabase Storage
             const { data, error } = await supabaseClient.storage
@@ -413,10 +445,28 @@
             
             if (error) {
                 console.error("Storage upload error:", error);
-                throw error;
+                // If bucket doesn't exist, create it
+                if (error.message.includes('bucket not found')) {
+                    const { error: createError } = await supabaseClient.storage
+                        .createBucket(storageBucket, { public: true });
+                    if (createError) {
+                        throw new Error(`Failed to create bucket: ${createError.message}`);
+                    }
+                    // Retry upload
+                    const { data: retryData, error: retryError } = await supabaseClient.storage
+                        .from(storageBucket)
+                        .upload(filePath, blob, {
+                            cacheControl: '3600',
+                            upsert: true,
+                            contentType: 'application/pdf'
+                        });
+                    if (retryError) throw retryError;
+                } else {
+                    throw error;
+                }
             }
             
-            console.log("Upload successful:", data);
+            console.log("Upload successful");
             
             // Get public URL
             const { data: urlData } = supabaseClient.storage
@@ -480,20 +530,12 @@
                 .order('id', { ascending: true });
             if (patientsError) throw new Error(`Fetch patients error: ${patientsError.message}`);
             
-            // Fetch reports - handle potential missing columns gracefully
+            // Fetch reports
             const { data: reportsData, error: reportsError } = await supabaseClient
                 .from('reports')
                 .select('*')
                 .order('upload_time', { ascending: false });
-            if (reportsError) {
-                // If reports table doesn't have expected columns, try a simpler query
-                console.warn("Error fetching reports, trying simpler query:", reportsError);
-                const { data: simpleReports, error: simpleError } = await supabaseClient
-                    .from('reports')
-                    .select('patient_id, filename, data_url, upload_time, staff');
-                if (simpleError) throw new Error(`Fetch reports error: ${simpleError.message}`);
-                reportsData = simpleReports;
-            }
+            if (reportsError) throw new Error(`Fetch reports error: ${reportsError.message}`);
             
             // Fetch appointments
             const { data: appointmentsData, error: appointmentsError } = await supabaseClient
@@ -559,7 +601,6 @@
             return false;
         }
     }
-
     async function saveDataToCloud() {
         if (!isCloudConnected || !supabaseClient) {
             showToast("Cloud not configured, saving locally");
@@ -693,33 +734,62 @@
                         
                         // Only insert if we have a valid URL
                         if (storageUrl) {
+                            // Format the upload time properly - ensure it's ISO format
+                            let uploadTime = report.uploadTime || new Date().toISOString();
+                            // If it's not in ISO format, convert it
+                            try {
+                                if (uploadTime && !uploadTime.includes('T')) {
+                                    const dateObj = new Date(uploadTime);
+                                    if (!isNaN(dateObj.getTime())) {
+                                        uploadTime = dateObj.toISOString();
+                                    } else {
+                                        uploadTime = new Date().toISOString();
+                                    }
+                                }
+                            } catch (e) {
+                                uploadTime = new Date().toISOString();
+                            }
+                            
                             // Prepare the report data - only include columns that exist
                             const reportData = {
                                 patient_id: patient.id,
                                 filename: report.filename || 'unknown.pdf',
                                 data_url: storageUrl,
-                                upload_time: report.uploadTime || new Date().toISOString(),
+                                upload_time: uploadTime,
                                 staff: report.staff || ''
                             };
                             
-                            // Only add file_path if it exists (will be handled by the database)
-                            // The database will use default null if column doesn't exist
+                            // Try to insert with all fields
                             try {
                                 const { error: reportError } = await supabaseClient
                                     .from('reports')
                                     .insert(reportData);
                                 if (reportError) {
                                     console.error("Report insert error:", reportError);
-                                    throw new Error(`Insert report error: ${reportError.message}`);
+                                    // Try without staff field if that's the issue
+                                    if (reportError.message.includes('staff')) {
+                                        delete reportData.staff;
+                                        const { error: retryError } = await supabaseClient
+                                            .from('reports')
+                                            .insert(reportData);
+                                        if (retryError) throw new Error(`Insert report error: ${retryError.message}`);
+                                    } else {
+                                        throw new Error(`Insert report error: ${reportError.message}`);
+                                    }
                                 }
                                 reportInsertCount++;
                             } catch (insertError) {
-                                // If insert fails, try without file_path
-                                console.warn("Insert with full data failed, trying without file_path");
-                                delete reportData.file_path;
+                                // Try without optional fields
+                                console.warn("Insert with full data failed, trying without optional fields");
+                                const minimalData = {
+                                    patient_id: patient.id,
+                                    filename: report.filename || 'unknown.pdf',
+                                    data_url: storageUrl,
+                                    upload_time: uploadTime
+                                };
                                 const { error: reportError } = await supabaseClient
                                     .from('reports')
-                                    .insert(reportData);
+                                    .insert(minimalData);
                                 if (reportError) throw new Error(`Insert report error: ${reportError.message}`);
                                 reportInsertCount++;
                             }
@@ -738,16 +808,31 @@
                 if (deleteApptError) throw new Error(`Delete appointment error: ${deleteApptError.message}`);
                 
                 if (patient.appointment && patient.appointment.datetime) {
-                    const { error: apptError } = await supabaseClient
-                        .from('appointments')
-                        .insert({
-                            patient_id: patient.id,
-                            datetime: patient.appointment.datetime || null,
-                            status: patient.appointment.status || 'pending',
-                            update_count: patient.appointment.updateCount || 0,
-                            updated_at: new Date().toISOString()
-                        });
-                    if (apptError) throw new Error(`Insert appointment error: ${apptError.message}`);
+                    // Format appointment datetime properly
+                    let apptDateTime = patient.appointment.datetime;
+                    try {
+                        if (apptDateTime && !apptDateTime.includes('T')) {
+                            const dateObj = new Date(apptDateTime);
+                            if (!isNaN(dateObj.getTime())) {
+                                apptDateTime = dateObj.toISOString();
+                            }
+                        }
+                    } catch (e) {
+                        apptDateTime = null;
+                    }
+                    
+                    if (apptDateTime) {
+                        const { error: apptError } = await supabaseClient
+                            .from('appointments')
+                            .insert({
+                                patient_id: patient.id,
+                                datetime: apptDateTime,
+                                status: patient.appointment.status || 'pending',
+                                update_count: patient.appointment.updateCount || 0,
+                                updated_at: new Date().toISOString()
+                            });
+                        if (apptError) throw new Error(`Insert appointment error: ${apptError.message}`);
+                    }
                 }
             }
             
@@ -1218,7 +1303,7 @@
             patients.push(patient); 
         }
         
-        // Handle file uploads
+        // In createOrUpdatePatient function - replace the file handling section
         if(files && files.length > 0){ 
             let uploadCount = 0;
             const totalFiles = files.length;
@@ -1230,7 +1315,8 @@
                     reader.onload = async function(e) { 
                         try {
                             const finalName = accession ? `${accession}.pdf` : file.name; 
-                            const now = new Date().toLocaleString('zh-HK'); 
+                            // Use proper ISO format for timestamp
+                            const now = new Date().toISOString();
                             
                             // Read the dataURL
                             const dataURL = e.target.result;
@@ -1238,11 +1324,11 @@
                             // Upload to Supabase Storage and get public URL
                             const publicUrl = await uploadFileToStorage(patient.id, dataURL, finalName);
                             
-                            // IMPORTANT: Create report with the storage URL
+                            // Create report with the storage URL
                             const reportData = { 
                                 filename: finalName, 
-                                dataURL: publicUrl || dataURL, // Use storage URL if available
-                                uploadTime: now, 
+                                dataURL: publicUrl || dataURL,
+                                uploadTime: now, // ISO format
                                 staff: staff,
                                 filePath: publicUrl ? `${patient.id}/${finalName}` : null
                             };
@@ -1260,17 +1346,14 @@
                                 // Force sync to cloud
                                 const syncResult = await saveDataToCloudWithRetry(3);
                                 if (syncResult) {
-                                    // Reload from cloud to ensure data consistency
                                     await loadDataFromCloud();
                                     renderAdminTable(); 
                                     showToast(`Uploaded ${totalFiles} file(s) successfully!`);
                                     
-                                    // If patient is logged in, refresh their reports
                                     if (currentUser && currentUser.role === 'patient') {
                                         loadPatientReports();
                                     }
                                 } else {
-                                    // Even if cloud sync fails, show the reports locally
                                     renderAdminTable();
                                     showToast("Files saved locally. Cloud sync will complete when you press 'Sync to Cloud'.");
                                 }
@@ -1301,7 +1384,8 @@
             
             // Clear file input after processing
             document.getElementById("reportPdfFile").value = "";
-        } else { 
+        }
+            else { 
             // No files, just save data
             saveData(); 
             saveDataToCloudWithRetry(3).then(() => {
