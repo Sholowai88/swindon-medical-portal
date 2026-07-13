@@ -193,11 +193,13 @@
         <div class="card" style="max-width: 480px; margin:0 auto; background: rgba(255,255,255,0.98);">
             <h2 style="color:#FF1493;"><span data-key="login_title">Portal Access</span></h2>
             <div class="form-group"><label data-key="username_label">Username (Mobile Number)</label><input type="text" id="loginUsername" placeholder="61234567"></div>
-            <div class="form-group"><label data-key="password_label">Password (First 4 numeric digits of HKID)</label><input type="password" id="loginPassword" placeholder="1234"></div>
+            <div class="form-group"><label data-key="password_label">Password (HKID/Passport (first 4 characters))</label><input type="password" id="loginPassword" placeholder="A123 or PP12"></div>
+            
             <button id="doLoginBtn" style="width:100%;"><span data-key="login_btn">Login</span></button>
             <div class="login-instruction" data-key="login_instruction_en">
                 <strong>📋 Login Instructions:</strong><br>
                 • <strong>Admin:</strong> Username: "admin" | Password: "admin123"<br>
+                • <strong>Manager:</strong> Username: "vivian" | Password: "vivian123"<br>
                 • <strong>Patient:</strong> Use your registered mobile number as Username<br>
                 • <strong>Password:</strong> First 4 characters of your HKID or Passport (including letters)<br>
                 • <strong>Examples:</strong> HKID A123456(7) ➡️ password: A123 | Passport PP123456789 ➡️ password: PP12<br>
@@ -206,6 +208,7 @@
             <div class="login-instruction" data-key="login_instruction_zh" style="display:none;">
                 <strong>📋 登入說明：</strong><br>
                 • <strong>管理員：</strong> 用戶名稱："admin" | 密碼："admin123"<br>
+                • <strong>經理：</strong> 用戶名稱："vivian" | 密碼："vivian123"<br>
                 • <strong>病人：</strong> 使用已登記的手機號碼作為用戶名稱<br>
                 • <strong>密碼：</strong> 香港身份證或護照號碼的首4位（包括字母）<br>
                 • <strong>範例：</strong> 身份證 A123456(7) ➡️ 密碼: A123 | 護照 PP123456789 ➡️ 密碼: PP12<br>
@@ -281,9 +284,87 @@
 
     // ========== MULTI-LANGUAGE ==========
     const translations = {
-        en: { title:"Swindon Medical", login_title:"Portal Access", username_label:"Username (Mobile)", password_label:"Password (First 4 numeric digits of HKID)", login_btn:"Login", logout:"Logout", create_patient:"Create / Edit Patient", mobile_numbers:"Mobile Number(s) (comma separated)", hkid:"HKID (first 4 numeric digits)", email_addr:"Email(s) (comma separated)", accession:"Accession #", upload_reports:"Upload Reports (PDF)", attach_create:"Attach & Save", records_title:"Patient Records", reports_column:"Reports", upload_time_col:"Upload Time", reporting_staff:"Reporting Staff", report_btn:"Report", appointment_btn:"Appointment", my_reports:"My Health Reports", book_appt:"Book Appointment", select_datetime:"Select Date & Time", confirm_notify:"Confirm and Notify Admin", save_settings:"Save Settings", sync_cloud:"Sync to Cloud" },
-        "zh-tw": { title:"德信醫療", login_title:"入口登入", username_label:"用戶名稱(手機)", password_label:"密碼(身份證號碼首4位數字)", login_btn:"登入", logout:"登出", create_patient:"建立/編輯病人", mobile_numbers:"手機號碼(逗號分隔)", hkid:"身份證數字首4位", email_addr:"電子郵件(逗號分隔)", accession:"登記編號", upload_reports:"上傳報告(PDF)", attach_create:"上傳並儲存", records_title:"病人記錄", reports_column:"報告", upload_time_col:"上傳時間", reporting_staff:"報告人員", report_btn:"報告", appointment_btn:"預約", my_reports:"我的報告", book_appt:"預約門診", select_datetime:"選擇日期時間", confirm_notify:"確認並通知管理員", save_settings:"儲存設定", sync_cloud:"同步至雲端" },
-        "zh-cn": { title:"德信医疗", login_title:"门户登录", username_label:"用户名(手机)", password_label:"密码(身份证号码首4位数字)", login_btn:"登录", logout:"退出", create_patient:"创建/编辑患者", mobile_numbers:"手机号码(逗号分隔)", hkid:"身份证数字首4位", email_addr:"电子邮件(逗号分隔)", accession:"登记编号", upload_reports:"上传报告(PDF)", attach_create:"上传并保存", records_title:"患者记录", reports_column:"报告", upload_time_col:"上传时间", reporting_staff:"报告人员", report_btn:"报告", appointment_btn:"预约", my_reports:"我的健康报告", book_appt:"预约门诊", select_datetime:"选择日期时间", confirm_notify:"确认并通知管理员", save_settings:"保存设置", sync_cloud:"同步到云端" }
+        en: { 
+            title:"Swindon Medical", 
+            login_title:"Portal Access", 
+            username_label:"Username (Mobile)", 
+            password_label:"Password (First 4 characters of HKID/Passport)", 
+            login_btn:"Login", 
+            logout:"Logout", 
+            create_patient:"Create / Edit Patient", 
+            mobile_numbers:"Mobile Number(s) (comma separated)", 
+            hkid:"HKID/Passport (first 4 characters)", 
+            email_addr:"Email(s) (comma separated)", 
+            accession:"Accession #", 
+            upload_reports:"Upload Reports (PDF)", 
+            attach_create:"Attach & Save", 
+            records_title:"Patient Records", 
+            reports_column:"Reports", 
+            upload_time_col:"Upload Time", 
+            reporting_staff:"Reporting Staff", 
+            report_btn:"Report", 
+            appointment_btn:"Appointment", 
+            my_reports:"My Health Reports", 
+            book_appt:"Book Appointment", 
+            select_datetime:"Select Date & Time", 
+            confirm_notify:"Confirm and Notify Admin", 
+            save_settings:"Save Settings", 
+            sync_cloud:"Sync to Cloud" 
+        },
+        "zh-tw": { 
+            title:"德信醫療", 
+            login_title:"入口登入", 
+            username_label:"用戶名稱(手機)", 
+            password_label:"密碼(身份證/護照號碼首4位)", 
+            login_btn:"登入", 
+            logout:"登出", 
+            create_patient:"建立/編輯病人", 
+            mobile_numbers:"手機號碼(逗號分隔)", 
+            hkid:"身份證/護照首4位", 
+            email_addr:"電子郵件(逗號分隔)", 
+            accession:"登記編號", 
+            upload_reports:"上傳報告(PDF)", 
+            attach_create:"上傳並儲存", 
+            records_title:"病人記錄", 
+            reports_column:"報告", 
+            upload_time_col:"上傳時間", 
+            reporting_staff:"報告人員", 
+            report_btn:"報告", 
+            appointment_btn:"預約", 
+            my_reports:"我的報告", 
+            book_appt:"預約門診", 
+            select_datetime:"選擇日期時間", 
+            confirm_notify:"確認並通知管理員", 
+            save_settings:"儲存設定", 
+            sync_cloud:"同步至雲端" 
+        },
+        "zh-cn": { 
+            title:"德信医疗", 
+            login_title:"门户登录", 
+            username_label:"用户名(手机)", 
+            password_label:"密码(身份证/护照号码首4位)", 
+            login_btn:"登录", 
+            logout:"退出", 
+            create_patient:"创建/编辑患者", 
+            mobile_numbers:"手机号码(逗号分隔)", 
+            hkid:"身份证/护照首4位", 
+            email_addr:"电子邮件(逗号分隔)", 
+            accession:"登记编号", 
+            upload_reports:"上传报告(PDF)", 
+            attach_create:"上传并保存", 
+            records_title:"患者记录", 
+            reports_column:"报告", 
+            upload_time_col:"上传时间", 
+            reporting_staff:"报告人员", 
+            report_btn:"报告", 
+            appointment_btn:"预约", 
+            my_reports:"我的健康报告", 
+            book_appt:"预约门诊", 
+            select_datetime:"选择日期时间", 
+            confirm_notify:"确认并通知管理员", 
+            save_settings:"保存设置", 
+            sync_cloud:"同步到云端" 
+        }
     };
     let currentLang = 'en';
     function setLanguage(lang) { currentLang = lang; updateUILanguage(); renderAdminTable(); if(currentUser?.role==='patient') loadPatientReports(); updateLoginInstruction(); }
@@ -729,10 +810,18 @@
     // ========== LOGIN & DASHBOARD ==========
     document.getElementById("doLoginBtn").addEventListener("click", () => { 
         const uname = document.getElementById("loginUsername").value.trim(); 
-        const pwd = document.getElementById("loginPassword").value.trim().toUpperCase(); 
+        const pwd = document.getElementById("loginPassword").value.trim(); 
         
+        // Admin login
         if(uname === "admin" && pwd === "admin123") { 
             currentUser = { username: "Admin", role: "admin" }; 
+            showDashboard(); 
+            return; 
+        } 
+        
+        // Manager login (new account)
+        if(uname === "vivian" && pwd === "vivian123") { 
+            currentUser = { username: "Vivian (Manager)", role: "admin" }; 
             showDashboard(); 
             return; 
         } 
@@ -750,7 +839,7 @@
             currentUser = { username: uname, role: "patient", patientId: found.id }; 
             showDashboard(); 
         } else { 
-            alert("Invalid credentials. Please check your mobile number and HKID/Passport prefix. Contact +852 55057221 for help."); 
+            alert("Invalid credentials. Please check your username and password. Contact +852 55057221 for help."); 
         } 
     });
     
